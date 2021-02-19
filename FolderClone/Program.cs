@@ -49,6 +49,12 @@ namespace FolderClone
             Func<FileInfo, bool> filePredicate = hidden ? null : FilterHiddenFile;
             cloner.MatchFilesAsync(destinationFolder, recurse: recurse, filterPredicate: filePredicate).GetAwaiter().GetResult();
 
+            if(deleteSource)
+            {
+                int removed = cloner.RemoveEmptyFolders();
+                Console.WriteLine($"{removed} Empty Folders Removed.");
+            }
+
             //Console.WriteLine($"Copy From \"{sourceFolder}\" To \"{destFolder}\" = {cloner.VerifyMatchAsync} Files copied, {cloner.VerifyCount} files verified and deleted.");
         }
 
@@ -119,14 +125,6 @@ namespace FolderClone
             {
                 Console.WriteLine($"Delete Match: {source.FullName}");
                 source.Delete();
-                var sourceFolder = source.Directory;
-                if(sourceFolder != null && sourceFolder.Exists)
-                {
-                    if (!sourceFolder.EnumerateFileSystemInfos().Any())
-                    {
-                        sourceFolder.Delete();
-                    }
-                }
             }
             return Task.CompletedTask;
         }

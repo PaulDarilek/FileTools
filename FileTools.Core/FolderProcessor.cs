@@ -22,11 +22,21 @@ namespace FileTools
             SourceFolder = new DirectoryInfo(sourcePath);
         }
 
+        /// <summary>Process each file in folder, and set up a comparison to matching relative path in another folder</summary>
+        /// <param name="destFolder">Folder to Compare or Copy to.</param>
+        /// <param name="recurse">True to process subdirectories</param>
+        /// <param name="filePattern">File pattern to match on. (Regular Expressions not valid)</param>
+        /// <param name="filterPredicate">Optional Filter for Source files</param>
         public async Task MatchFilesAsync(string destFolder, bool recurse = true, string filePattern = "*", Func<FileInfo, bool> filterPredicate = null)
         {
             await MatchFilesAsync(new DirectoryInfo(destFolder), recurse, filePattern, filterPredicate);
         }
 
+        /// <summary>Process each file in folder, and set up a comparison to matching relative path in another folder</summary>
+        /// <param name="destFolder">Folder to Compare or Copy to.</param>
+        /// <param name="recurse">True to process subdirectories</param>
+        /// <param name="filePattern">File pattern to match on. (Regular Expressions not valid)</param>
+        /// <param name="filterPredicate">Optional Filter for Source files</param>
         public async Task MatchFilesAsync(DirectoryInfo destFolder, bool recurse = true, string filePattern = "*", Func<FileInfo, bool> filterPredicate = null)
         {
             if (!SourceFolder.Exists)
@@ -78,6 +88,27 @@ namespace FileTools
                     }
                 }
             }
+        }
+
+        public int RemoveEmptyFolders(string pattern = "*", bool recurse = true)
+        {
+            int count = 0;
+            Stack<string> stack = new Stack<string>();
+            stack.Push(SourceFolder.FullName);
+            foreach (var info in SourceFolder.EnumerateDirectories(pattern, recurse ? SearchOption.AllDirectories : SearchOption.TopDirectoryOnly))
+            {
+                stack.Push(info.FullName);
+            }
+            while(stack.Count > 0)
+            {
+                DirectoryInfo info = new DirectoryInfo(stack.Pop());
+                if(! info.GetFileSystemInfos().Any())
+                {
+                    info.Delete();
+                    count++;
+                }
+            }
+            return count;
         }
 
         /// <summary>Do Nothing Asyncronously</summary>

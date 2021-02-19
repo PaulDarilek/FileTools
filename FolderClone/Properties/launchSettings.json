@@ -1,8 +1,7 @@
 {
   "profiles": {
     "FolderClone": {
-      "commandName": "Project",
-      "commandLineArgs": "b:\\ a:\\  -r -h --DeleteSource"
+      "commandName": "Project"
     }
   }
 }

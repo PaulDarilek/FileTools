@@ -4,26 +4,44 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Text;
 using System.Threading.Tasks;
+using System.Diagnostics;
 
 namespace FileTools
 {
     public static class FileExtensions
     {
+        public const int MinimumBufferSize = 256;
         public const int DefaultBufferSize = 4096 * 2;
 
-        public static async Task<bool> CopyFileAsync(this FileInfo sourceInfo, string destination, int bufferSize = DefaultBufferSize)
+        public static void CopyTo(this FileInfo sourceInfo, FileInfo destInfo)
+            => sourceInfo.CopyToAsync(destInfo).GetAwaiter().GetResult();
+
+        public static async Task CopyToAsync(this FileInfo sourceInfo, FileInfo destInfo)
+            => await sourceInfo.CopyToAsync(destInfo, DefaultBufferSize);
+
+        [DebuggerStepThrough()]
+        public static async Task CopyToAsync(this FileInfo sourceInfo, FileInfo destInfo, int bufferSize)
         {
-            if(!sourceInfo.Exists)
+            if (!sourceInfo.Exists)
             {
                 throw new FileNotFoundException(sourceInfo.FullName);
             }
 
-            var destInfo = new FileInfo(destination);
-            bufferSize = bufferSize > 0 ? bufferSize : DefaultBufferSize;
+            // Eliminate DirectoryNotFoundException by creating folder if it is missing.
+            var folder = new DirectoryInfo(destInfo.DirectoryName);
+            if (!folder.Exists)
+            {
+                folder.Create();
+            }
+
+            if (bufferSize < MinimumBufferSize)
+            {
+                bufferSize = DefaultBufferSize;
+            }
 
             using (FileStream sourceStream = File.Open(sourceInfo.FullName, FileMode.Open, FileAccess.Read, FileShare.Read))
             {
-                using FileStream destinationStream = File.Create(destination, bufferSize, FileOptions.Asynchronous);
+                using FileStream destinationStream = File.Create(destInfo.FullName, bufferSize, FileOptions.Asynchronous);
                 await sourceStream.CopyToAsync(destinationStream);
             }
 
@@ -32,11 +50,16 @@ namespace FileTools
             destInfo.CreationTimeUtc = sourceInfo.CreationTimeUtc;
             destInfo.LastAccessTimeUtc = sourceInfo.LastAccessTimeUtc;
             //* Skip: destInfo.Attributes = sourceInfo.Attributes;
-
-            return sourceInfo.Exists && destInfo.Exists && sourceInfo.Length == destInfo.Length;
         }
 
-        public static async Task<bool> FilesAreEqualAsync(this FileInfo sourceInfo, FileInfo destInfo, int bufferSize = DefaultBufferSize)
+        /// <summary>Compares two files byte-for-byte and returns True if they match.</summary>
+        [DebuggerStepThrough()]
+        public static async Task<bool> BinaryFileCompareAsync(this FileInfo sourceInfo, FileInfo destInfo)
+            => await BinaryFileCompareAsync(sourceInfo, destInfo, DefaultBufferSize);
+
+        /// <summary>Compares two files byte-for-byte and returns True if they match.</summary>
+        [DebuggerStepThrough()]
+        public static async Task<bool> BinaryFileCompareAsync(this FileInfo sourceInfo, FileInfo destInfo, int bufferSize)
         {
             if (!sourceInfo.Exists || !destInfo.Exists || sourceInfo.Length != destInfo.Length)
             {
@@ -45,7 +68,10 @@ namespace FileTools
             }
             long fileLength = sourceInfo.Length;
 
-            bufferSize = bufferSize > 0 ? bufferSize : DefaultBufferSize;
+            if (bufferSize < MinimumBufferSize)
+            {
+                bufferSize = DefaultBufferSize;
+            }
             byte[] sourceData = new byte[bufferSize];
             byte[] destData = new byte[bufferSize];
             long offset = 0;
@@ -55,8 +81,8 @@ namespace FileTools
             while (offset < fileLength)
             {
                 // start both tasks to read.
-                var sTask = sourceStream.ReadAsync(sourceData, (int)offset, bufferSize);
-                var dTask = destinationStream.ReadAsync(destData, (int)offset, bufferSize);
+                var sTask = sourceStream.ReadAsync(sourceData, 0, bufferSize);
+                var dTask = destinationStream.ReadAsync(destData, 0, bufferSize);
 
                 // wait on both tasks.
                 int sBytes = await sTask;
@@ -69,6 +95,14 @@ namespace FileTools
                     // one or both files are at End of File.
                     break;
                 }
+                else
+                {
+                    if(sBytes != dBytes)
+                    {
+                        sourceStream.Seek(offset + count, SeekOrigin.Begin);
+                        destinationStream.Seek(offset + count, SeekOrigin.Begin);
+                    }
+                }
                 for (int i = 0; i < count; i++)
                 {
                     if (sourceData[i] != destData[i])
@@ -80,8 +114,8 @@ namespace FileTools
             }
 
             // all the bytes read and compared total the file length
-            return offset == fileLength;
-
+            bool success = (offset == fileLength);
+            return success;
         }
 
 

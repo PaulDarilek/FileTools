@@ -1,74 +1,136 @@
 ﻿using FileTools;
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Threading.Tasks;
 
 namespace FolderClone
 {
-    internal class Program
+    internal static class Program
     {
         internal static void Main(string[] args)
         {
-            if (args.Length < 2 || args.Length > 3 || args.Any(arg => arg.StartsWith("--Help", StringComparison.OrdinalIgnoreCase)))
+            var argList = args.ToList();
+
+            if (argList.Count < 2 || argList.HasSwitch("-?", "--help"))
             {
                 Console.WriteLine($"FolderClone sourceFolder destinationFolder --DeleteSource");
                 Console.WriteLine($"\t Where:");
                 Console.WriteLine($"\t   sourceFolder is the Source to copy From.");
                 Console.WriteLine($"\t   destinationFolder is the target folder to Copy (if needed).");
+                Console.WriteLine($"\t   -? or --help is optional parameter to display this help.");
+                Console.WriteLine($"\t   -r or --recurse enables searching subdirectories");
+                Console.WriteLine($"\t   -h or --hidden copies hidden files also");
                 Console.WriteLine($"\t   --DeleteSource is optional parameter to remove source files after verifying bytes match in each file.");
                 return;
             }
 
-            string sourceFolder = args[0];
-            string destFolder = args[1];
-            bool isDelete = (args.Length > 2) && args[3].Equals("--DeleteSource", StringComparison.OrdinalIgnoreCase);
+            string sourceFolder = argList.NextParm(true, nameof(sourceFolder));
+            string destinationFolder = argList.NextParm(true, nameof(destinationFolder));
+            bool hidden = argList.HasSwitch("-h", "--hidden");
+            bool recurse = argList.HasSwitch("-r", "--recurse");
+            bool deleteSource = argList.HasSwitch("--DeleteSource");
 
-            var cloner = new FolderCloner(sourceFolder, destFolder)
+            var cloner = new FolderProcessor(sourceFolder)
             {
-                CopyFilter = ShouldCopy,
-                VerifyMatch = isDelete ? VerifyAndDeleteSource : NoVerify,
+                VerifyMatchAsync = BinaryCompareAsync,
+                OnVerifyFailedAsync = CopyFileAsync,
+                OnVerifyPassedAsync = null,
+                OnException = (source, dest, ex) => Console.Error.WriteLine($"Error {ex.Message}: {source.FullName} {dest.FullName}"),
             };
 
-            cloner.CloneAsync().GetAwaiter().GetResult();
-
-            Console.WriteLine($"Copy From \"{sourceFolder}\" To \"{destFolder}\" = {cloner.CopyFilter} Files copied, {cloner.VerifyCount} files verified and deleted.");
-        }
-
-        private static bool ShouldCopy(FileInfo source, FileInfo destination)
-        {
-            if(!source.Exists)
+            if (deleteSource)
             {
-                throw new FileNotFoundException(source.FullName);
+                cloner.OnVerifyPassedAsync = DeleteMatchedSourceFile;
+                cloner.OnVerifyFailedAsync = CopyVerifyAndDeleteAsync;
             }
 
-            bool shouldCopy =
-                destination.Exists == false ||
-                source.Length != destination.Length ||
-                source.LastWriteTimeUtc != destination.LastWriteTimeUtc;
+            Func<FileInfo, bool> filePredicate = hidden ? null : FilterHiddenFile;
+            cloner.MatchFilesAsync(destinationFolder, recurse: recurse, filterPredicate: filePredicate).GetAwaiter().GetResult();
 
-            if (shouldCopy)
-            {
-                Console.WriteLine($"{source.FullName}\t{destination.FullName}");
-                return true;
-            }
-            return false;
+            //Console.WriteLine($"Copy From \"{sourceFolder}\" To \"{destFolder}\" = {cloner.VerifyMatchAsync} Files copied, {cloner.VerifyCount} files verified and deleted.");
         }
 
-        private static bool VerifyAndDeleteSource(FileInfo source, FileInfo destination)
+        private static bool FilterHiddenFile(this FileInfo file) => !file.Attributes.HasFlag(FileAttributes.Hidden);
+
+        private static bool HasSwitch(this List<string> argList, params string[] switches)
         {
-            var areEqual = source.FilesAreEqualAsync(destination).GetAwaiter().GetResult();
-            if (areEqual)
+            bool found = false;
+            foreach (var switchPattern in switches)
             {
-                Console.WriteLine($"Delete {source.FullName}");
-                source.Delete();
+                if (argList.Count == 0)
+                    return found;
+
+                var value = argList.FirstOrDefault(arg => arg.Equals(switchPattern, StringComparison.OrdinalIgnoreCase));
+                if (value != null)
+                {
+                    found = true;
+                    argList.Remove(value);
+                }
+            }
+            return found;
+        }
+
+        private static string NextParm(this List<string> argList, bool required, string parameterName)
+        {
+            string arg = null;
+            if(argList.Count > 0)
+            {
+                arg = argList[0];
+                argList.RemoveAt(0);
             }
             else
             {
-                Console.WriteLine($"Not a Match: {source.FullName} and {destination.FullName}");
+                if (required)
+                    throw new ArgumentNullException(parameterName);
             }
-            return areEqual;
+            return arg;
         }
 
-        private static bool NoVerify(FileInfo source, FileInfo dest) => false;
+        private static async Task<bool> BinaryCompareAsync(FileInfo source, FileInfo destination)
+        {
+            Console.Write($"Compare: {source.FullName} to {destination.FullName} ");
+            bool isMatch = await source.BinaryFileCompareAsync(destination);
+            Console.WriteLine(isMatch ? "(Matched)" : "(Failed)");
+            return isMatch;
+        }
+
+        private static async Task CopyFileAsync(FileInfo source, FileInfo destination)
+        {
+            Console.Write($"Copying File: {source.FullName} to {destination.FullName} ");
+            await source.CopyToAsync(destination);
+            Console.WriteLine(" (Done)");
+        }
+
+        private static async Task CopyVerifyAndDeleteAsync(FileInfo source, FileInfo destination)
+        {
+            await CopyFileAsync(source, destination);
+            bool verified = await BinaryCompareAsync(source, destination);
+            if(verified)
+            {
+                await DeleteMatchedSourceFile(source, destination);
+            }
+        }
+
+        private static Task DeleteMatchedSourceFile(FileInfo source, FileInfo destination)
+        {
+            if(source.Exists && destination.Exists && source.Length == destination.Length)
+            {
+                Console.WriteLine($"Delete Match: {source.FullName}");
+                source.Delete();
+                var sourceFolder = source.Directory;
+                if(sourceFolder != null && sourceFolder.Exists)
+                {
+                    if (!sourceFolder.EnumerateFileSystemInfos().Any())
+                    {
+                        sourceFolder.Delete();
+                    }
+                }
+            }
+            return Task.CompletedTask;
+        }
+
+
     }
 }

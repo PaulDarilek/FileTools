@@ -3,132 +3,228 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
-using System.Threading.Tasks;
 
 namespace FolderClone
 {
     internal static class Program
     {
+        private static readonly Dictionary<string, FileCompareDelegate> _AllHandlers = FolderProcessor.GetHandlerDictionary();
+        private static readonly Dictionary<string, int> _EventStats =
+            new Dictionary<string, int>(
+                Enum.GetNames(typeof(FileCompareEvent))
+                .Where(name => name != nameof(FileCompareEvent.None))
+                .Select(name => new KeyValuePair<string, int>(name, 0)),
+                StringComparer.OrdinalIgnoreCase);
+
         internal static void Main(string[] args)
+        {
+            var cloner = ConfigureCloner(args, out string destinationFolder, out bool clean);
+
+            cloner.MatchFilesAsync(destinationFolder).GetAwaiter().GetResult();
+            ShowStats();
+            if(clean)
+            {
+                CleanEmptyFolders(cloner.SourceFolder, new DirectoryInfo(destinationFolder));
+            }
+        }
+
+        private static void ShowStats()
+        {
+            if (_EventStats.Where(kv => kv.Value != 0).Any())
+            {
+                Console.WriteLine("Event Counts:");
+                foreach (var pair in _EventStats.Where(kv => kv.Value != 0))
+                {
+                    Console.WriteLine($"\t {pair.Key} = {pair.Value}");
+                }
+            }
+        }
+
+        private static void CleanEmptyFolders(DirectoryInfo sourceFolder, DirectoryInfo targetFolder)
+        {
+            if (_EventStats[nameof(FileCompareEvent.SourceDeleted)] > 0)
+            {
+                Console.Write($"Folder: {sourceFolder} cleaning empty folders: ");
+                var count = sourceFolder.RemoveEmptyFolders();
+                Console.WriteLine($"{count} folders removed.");
+            }
+
+            if (_EventStats[nameof(FileCompareEvent.TargetDeleted)] > 0)
+            {
+                Console.Write($"Folder: {targetFolder} cleaning empty folders: ");
+                var count = targetFolder.RemoveEmptyFolders();
+                Console.WriteLine($"{count} folders removed.");
+            }
+        }
+
+        private static FolderProcessor ConfigureCloner(string[] args, out string destinationFolder, out bool clean)
         {
             var argList = args.ToList();
 
-            if (argList.Count < 2 || argList.HasSwitch("-?", "--help"))
+            if (argList.Count < 2 || HasSwitch("-?", "--help"))
             {
-                Console.WriteLine($"FolderClone sourceFolder destinationFolder --DeleteSource");
-                Console.WriteLine($"\t Where:");
-                Console.WriteLine($"\t   sourceFolder is the Source to copy From.");
-                Console.WriteLine($"\t   destinationFolder is the target folder to Copy (if needed).");
-                Console.WriteLine($"\t   -? or --help is optional parameter to display this help.");
-                Console.WriteLine($"\t   -r or --recurse enables searching subdirectories");
-                Console.WriteLine($"\t   -h or --hidden copies hidden files also");
-                Console.WriteLine($"\t   --DeleteSource is optional parameter to remove source files after verifying bytes match in each file.");
-                return;
+                ShowHelp();
+                destinationFolder = null;
+                clean = false;
+                return null;
             }
 
-            string sourceFolder = argList.NextParm(true, nameof(sourceFolder));
-            string destinationFolder = argList.NextParm(true, nameof(destinationFolder));
-            bool hidden = argList.HasSwitch("-h", "--hidden");
-            bool recurse = argList.HasSwitch("-r", "--recurse");
-            bool deleteSource = argList.HasSwitch("--DeleteSource");
+            string sourceFolder = NextParm(true, nameof(sourceFolder));
+            destinationFolder = NextParm(true, nameof(destinationFolder));
+            bool recurse = HasSwitch("-r", "--recurse");
+            bool skipHidden = HasSwitch("-h", "--hidden");
+            clean = HasSwitch("-c", "--clean");
 
             var cloner = new FolderProcessor(sourceFolder)
             {
-                VerifyMatchAsync = BinaryCompareAsync,
-                OnVerifyFailedAsync = CopyFileAsync,
-                OnVerifyPassedAsync = null,
-                OnException = (source, dest, ex) => Console.Error.WriteLine($"Error {ex.Message}: {source.FullName} {dest.FullName}"),
+                OnEventRaised = DisplayEvent,
+                OnException = (evt, source, dest, ex) => Console.Error.WriteLine($"Error processing {evt}: {ex.Message}, {source.FullName} {dest.FullName}"),
+                Recurse = recurse,
+                FileFilter = skipHidden ? FilterHiddenFile : null,
             };
 
-            if (deleteSource)
+            for (int i = 0; i < argList.Count; i++)
             {
-                cloner.OnVerifyPassedAsync = DeleteMatchedSourceFile;
-                cloner.OnVerifyFailedAsync = CopyVerifyAndDeleteAsync;
+                var arg = argList[i];
+                bool isValid = !string.IsNullOrWhiteSpace(arg) && arg.StartsWith("--") && arg.Contains("=");
+                if (isValid)
+                {
+                    var index = arg.IndexOf('=');
+                    string eventName = arg[2..index].Trim();
+                    string handlerName = arg[(index + 1)..].Trim();
+                    isValid = _AllHandlers.ContainsKey(handlerName) && _EventStats.ContainsKey(eventName);
+                    if (isValid)
+                    {
+                        FileCompareEvent eventKey = (FileCompareEvent)Enum.Parse(typeof(FileCompareEvent), eventName);
+                        cloner.WithHandler(eventKey, _AllHandlers[handlerName]);
+                    }
+                }
+                if (!isValid)
+                {
+                    Console.Error.WriteLine($"Error, Unknown Command: {arg}");
+                    ShowHelp();
+                }
             }
 
-            Func<FileInfo, bool> filePredicate = hidden ? null : FilterHiddenFile;
-            cloner.MatchFilesAsync(destinationFolder, recurse: recurse, filterPredicate: filePredicate).GetAwaiter().GetResult();
-
-            if(deleteSource)
+            if(cloner.Handlers.Count == 0)
             {
-                int removed = cloner.RemoveEmptyFolders();
-                Console.WriteLine($"{removed} Empty Folders Removed.");
+                Console.WriteLine($"No Handlers... Here is a recommendation:");
+                Console.WriteLine($"\t--{nameof(FileCompareEvent.TargetNotFound)}={nameof(FolderProcessor.CopySourceToTarget)}");
+                Console.Write("Add recommended handler? (Press Y or N)");
+                var key = Console.ReadKey();
+                Console.WriteLine();
+                if (key.KeyChar == 'y' || key.KeyChar == 'Y')
+                    cloner.WithHandler(FileCompareEvent.TargetNotFound, FolderProcessor.CopySourceToTarget);
             }
 
-            //Console.WriteLine($"Copy From \"{sourceFolder}\" To \"{destFolder}\" = {cloner.VerifyMatchAsync} Files copied, {cloner.VerifyCount} files verified and deleted.");
+            return cloner;
+
+            // test for a switch being set (false if not set).
+            bool HasSwitch(params string[] switches)
+            {
+                bool found = false;
+                foreach (var switchPattern in switches)
+                {
+                    if (argList.Count == 0)
+                        return found;
+
+                    var value = argList.FirstOrDefault(arg => arg.Equals(switchPattern, StringComparison.OrdinalIgnoreCase));
+                    if (value != null)
+                    {
+                        found = true;
+                        argList.Remove(value);
+                    }
+                }
+                return found;
+            }
+
+            // Get next parameter, then remove from the list.
+            string NextParm(bool required, string parameterName)
+            {
+                string arg = null;
+                if (argList.Count > 0)
+                {
+                    arg = argList[0];
+                    argList.RemoveAt(0);
+                }
+                else
+                {
+                    if (required)
+                        throw new ArgumentNullException(parameterName);
+                }
+                return arg;
+            }
+
+        }
+
+        private static void ShowHelp()
+        {
+            Console.WriteLine($"FolderClone sourceFolder destinationFolder --DeleteSource");
+            Console.WriteLine($"\t Where:");
+            Console.WriteLine($"\t   sourceFolder is the Source to copy From.");
+            Console.WriteLine($"\t   destinationFolder is the target folder to Copy (if needed).");
+            Console.WriteLine($"\t   -? or --help is optional parameter to display this help.");
+            Console.WriteLine($"\t   -r or --recurse enables searching subdirectories.");
+            Console.WriteLine($"\t   -h or --hidden filters out hidden files from being processed.");
+            Console.WriteLine($"\t   --EventName=HandlerName");
+            Console.WriteLine($"\t   EventNames: ({string.Join("|", _EventStats.Keys)})");
+            Console.WriteLine($"\t   HandlerNames: ({string.Join("|", _AllHandlers.Keys)})");
+
+            Console.WriteLine();
+            Console.WriteLine("Example:");
+            Console.WriteLine($"\t--{nameof(FileCompareEvent.TargetNotFound)}={nameof(FolderProcessor.CopySourceToTarget)}");
+            Console.WriteLine($"\t--{nameof(FileCompareEvent.TargetFound)}={nameof(FolderProcessor.CompareFileLength)}");
+            Console.WriteLine($"\t--{nameof(FileCompareEvent.LengthNotEqual)}={nameof(FolderProcessor.CopySourceToTarget)}");
+
+            System.Environment.Exit(-1);
+        }
+
+        private static void DisplayEvent(FileCompareEvent fileEvent, FileInfo source, FileInfo target)
+        {
+            // Count events.
+            _EventStats[fileEvent.ToString()] += 1;
+
+            switch (fileEvent)
+            {
+                case FileCompareEvent.TargetFound:
+                    Console.WriteLine($"{fileEvent}: {target.FullName} ({target.Length} bytes)");
+                    break;
+                
+                case FileCompareEvent.TargetNotFound:
+                    Console.WriteLine($"{fileEvent}: {target.FullName}\n\t(Source: {source.FullName} {source.Length} bytes)");
+                    break;
+                
+                case FileCompareEvent.TargetWritten:
+                    Console.WriteLine($"\t{fileEvent}: {target.Name} ({target.Length} bytes)");
+                    break;
+                
+                case FileCompareEvent.TargetDeleted:
+                    Console.WriteLine($"\t{fileEvent}: {target.Name}");
+                    break;
+
+                case FileCompareEvent.SourceWritten:
+                    Console.WriteLine($"\t{fileEvent}: {source.Name} ({source.Length} bytes)");
+                    break;
+                case FileCompareEvent.SourceDeleted:
+                    Console.WriteLine($"\t{fileEvent}: {source.FullName}");
+                    break;
+                
+                case FileCompareEvent.LengthEqual:
+                case FileCompareEvent.LengthNotEqual:
+                    Console.WriteLine($"\t{fileEvent}: {source.Name} ({source.Length} {target.Length} bytes)");
+                    break;
+                
+                case FileCompareEvent.BytesEqual:
+                case FileCompareEvent.BytesNotEqual:
+                    Console.WriteLine($"\t{fileEvent}: {source.Name} ({source.Length} {target.Length} bytes)");
+                    break;
+                
+                default:
+                    Console.WriteLine($"\t{fileEvent}:{source.FullName}\n\t{target.FullName}");
+                    break;
+            }
         }
 
         private static bool FilterHiddenFile(this FileInfo file) => !file.Attributes.HasFlag(FileAttributes.Hidden);
-
-        private static bool HasSwitch(this List<string> argList, params string[] switches)
-        {
-            bool found = false;
-            foreach (var switchPattern in switches)
-            {
-                if (argList.Count == 0)
-                    return found;
-
-                var value = argList.FirstOrDefault(arg => arg.Equals(switchPattern, StringComparison.OrdinalIgnoreCase));
-                if (value != null)
-                {
-                    found = true;
-                    argList.Remove(value);
-                }
-            }
-            return found;
-        }
-
-        private static string NextParm(this List<string> argList, bool required, string parameterName)
-        {
-            string arg = null;
-            if(argList.Count > 0)
-            {
-                arg = argList[0];
-                argList.RemoveAt(0);
-            }
-            else
-            {
-                if (required)
-                    throw new ArgumentNullException(parameterName);
-            }
-            return arg;
-        }
-
-        private static async Task<bool> BinaryCompareAsync(FileInfo source, FileInfo destination)
-        {
-            Console.Write($"Compare: {source.FullName} to {destination.FullName} ");
-            bool isMatch = await source.BinaryFileCompareAsync(destination);
-            Console.WriteLine(isMatch ? "(Matched)" : "(Failed)");
-            return isMatch;
-        }
-
-        private static async Task CopyFileAsync(FileInfo source, FileInfo destination)
-        {
-            Console.Write($"Copying File: {source.FullName} to {destination.FullName} ");
-            await source.CopyToAsync(destination);
-            Console.WriteLine(" (Done)");
-        }
-
-        private static async Task CopyVerifyAndDeleteAsync(FileInfo source, FileInfo destination)
-        {
-            await CopyFileAsync(source, destination);
-            bool verified = await BinaryCompareAsync(source, destination);
-            if(verified)
-            {
-                await DeleteMatchedSourceFile(source, destination);
-            }
-        }
-
-        private static Task DeleteMatchedSourceFile(FileInfo source, FileInfo destination)
-        {
-            if(source.Exists && destination.Exists && source.Length == destination.Length)
-            {
-                Console.WriteLine($"Delete Match: {source.FullName}");
-                source.Delete();
-            }
-            return Task.CompletedTask;
-        }
-
-
     }
 }

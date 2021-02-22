@@ -1,18 +1,21 @@
 ﻿using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Text;
-using System.Threading.Tasks;
+using System.IO;
 
 namespace FileTools
 {
-    class FileInfoCopy 
+    class FileMetaData 
     {
         /// <summary>Does the File Exist.</summary>
         public bool Exists { get; }
 
+        /// <summary>Computer (machine) where Drive or Share is found.</summary>
+        public string MachineName { get; }
+
+        /// <summary>Drive Letter or Share Path (Root)</summary>
+        public string DrivePath { get; }
+
         /// <summary>Full Path of Directory the file is in.</summary>
-        public string DirectoryName { get; }
+        public string DirectoryPath{ get; }
 
         /// <summary>Size of file in bytes</summary>
         public long Length { get; }
@@ -35,13 +38,20 @@ namespace FileTools
         /// <summary>When File was Created</summary>
         public DateTime? CreationTimeUTC { get; set; }
 
-        public FileInfoCopy(string fileName)
+
+        public FileMetaData(string fileName, string machineName = null) : this(new FileInfo(fileName), machineName)
         {
-            var info = new System.IO.FileInfo(fileName);
+            // chained constructor.
+        }
+            
+        public FileMetaData(FileInfo info, string machineName = null)
+        {
             Exists = info.Exists;
             if(Exists)
             {
-                DirectoryName = info.DirectoryName;
+                MachineName = machineName ?? System.Environment.MachineName;
+                DrivePath = info.Directory.Root.FullName;
+                DirectoryPath = info.DirectoryName[DrivePath.Length..];
                 Length = info.Length;
                 Name = info.Name;
                 FullName = info.FullName;
@@ -51,5 +61,6 @@ namespace FileTools
                 CreationTimeUTC = info.CreationTimeUtc;
             }
         }
+
     }
 }

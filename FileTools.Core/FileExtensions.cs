@@ -2,7 +2,6 @@
 using System.IO;
 using System.Collections.Generic;
 using System.Linq;
-using System.Text;
 using System.Threading.Tasks;
 using System.Diagnostics;
 
@@ -11,11 +10,14 @@ namespace FileTools
     public static class FileExtensions
     {
         public const int MinimumBufferSize = 256;
+        public const int MaximumBufferSize = 1024 * 1024;
         public const int DefaultBufferSize = 4096 * 2;
 
+        [DebuggerStepThrough()]
         public static void CopyTo(this FileInfo sourceInfo, FileInfo destInfo)
             => sourceInfo.CopyToAsync(destInfo).GetAwaiter().GetResult();
 
+        [DebuggerStepThrough()]
         public static async Task CopyToAsync(this FileInfo sourceInfo, FileInfo destInfo)
             => await sourceInfo.CopyToAsync(destInfo, DefaultBufferSize);
 
@@ -34,7 +36,7 @@ namespace FileTools
                 folder.Create();
             }
 
-            if (bufferSize < MinimumBufferSize)
+            if (bufferSize < MinimumBufferSize || bufferSize > MaximumBufferSize)
             {
                 bufferSize = DefaultBufferSize;
             }
@@ -68,7 +70,7 @@ namespace FileTools
             }
             long fileLength = sourceInfo.Length;
 
-            if (bufferSize < MinimumBufferSize)
+            if (bufferSize < MinimumBufferSize || bufferSize > MaximumBufferSize)
             {
                 bufferSize = DefaultBufferSize;
             }
@@ -118,6 +120,27 @@ namespace FileTools
             return success;
         }
 
+        [DebuggerStepThrough()]
+        public static int RemoveEmptyFolders(this DirectoryInfo directory, string pattern = "*", bool recurse = true)
+        {
+            int count = 0;
+            Stack<string> stack = new Stack<string>();
+            stack.Push(directory.FullName);
+            foreach (var info in directory.EnumerateDirectories(pattern, recurse ? SearchOption.AllDirectories : SearchOption.TopDirectoryOnly))
+            {
+                stack.Push(info.FullName);
+            }
+            while (stack.Count > 0)
+            {
+                DirectoryInfo info = new DirectoryInfo(stack.Pop());
+                if (!info.GetFileSystemInfos().Any())
+                {
+                    info.Delete();
+                    count++;
+                }
+            }
+            return count;
+        }
 
     }
 }

@@ -7,22 +7,28 @@ using System.Diagnostics;
 
 namespace FileTools
 {
-    public static class FileExtensions
+    public static class FileInfoExtensions
     {
         public const int MinimumBufferSize = 256;
         public const int MaximumBufferSize = 1024 * 1024;
         public const int DefaultBufferSize = 4096 * 2;
+        public static bool CopyCreationTimeUtc { get; set; } = true;
+        public static bool ClearSourceArchiveBit { get; set; } = true;
 
         [DebuggerStepThrough()]
-        public static void CopyTo(this FileInfo sourceInfo, FileInfo destInfo)
-            => sourceInfo.CopyToAsync(destInfo).GetAwaiter().GetResult();
+        public static bool CopyTo(this FileInfo sourceInfo, FileInfo destInfo)
+            => sourceInfo.CopyToAsync(destInfo, DefaultBufferSize).GetAwaiter().GetResult();
 
         [DebuggerStepThrough()]
-        public static async Task CopyToAsync(this FileInfo sourceInfo, FileInfo destInfo)
-            => await sourceInfo.CopyToAsync(destInfo, DefaultBufferSize);
+        public static async Task<bool> CopyToAsync(this FileInfo sourceInfo, FileInfo destInfo)
+        {
+            await sourceInfo.CopyToAsync(destInfo, DefaultBufferSize);
+            destInfo.Refresh();
+            return destInfo.Exists && destInfo.Length == sourceInfo.Length;
+        }
 
         [DebuggerStepThrough()]
-        public static async Task CopyToAsync(this FileInfo sourceInfo, FileInfo destInfo, int bufferSize)
+        public static async Task<bool> CopyToAsync(this FileInfo sourceInfo, FileInfo destInfo, int bufferSize)
         {
             if (!sourceInfo.Exists)
             {
@@ -36,6 +42,16 @@ namespace FileTools
                 folder.Create();
             }
 
+            // switch allows copying source CreationTimeUtc if set to True.
+            // if not set, the target file's CreationTimeUtc will be kept if the file exists.
+            // otherwise it was created now.
+            var creationTime =
+                CopyCreationTimeUtc ?
+                sourceInfo.CreationTimeUtc :
+                destInfo.Exists ?
+                destInfo.CreationTimeUtc :
+                DateTime.UtcNow;
+
             if (bufferSize < MinimumBufferSize || bufferSize > MaximumBufferSize)
             {
                 bufferSize = DefaultBufferSize;
@@ -47,21 +63,31 @@ namespace FileTools
                 await sourceStream.CopyToAsync(destinationStream);
             }
 
-            // clone Create and Last Update time.
+            // set filesystem dates and attributes.
             destInfo.Refresh();
-            destInfo.CreationTimeUtc = sourceInfo.CreationTimeUtc;
-            destInfo.LastAccessTimeUtc = sourceInfo.LastAccessTimeUtc;
-            //* Skip: destInfo.Attributes = sourceInfo.Attributes;
+            destInfo.CreationTimeUtc = creationTime;
+            destInfo.LastWriteTimeUtc = sourceInfo.LastWriteTimeUtc;
+            destInfo.Attributes = sourceInfo.Attributes;
+            //default:
+            destInfo.LastAccessTime = DateTime.UtcNow;
+
+            if(ClearSourceArchiveBit && sourceInfo.Attributes.HasFlag(FileAttributes.Archive))
+            {
+                // be a good backup tool.
+                sourceInfo.Attributes &= ~FileAttributes.Archive;
+            }
+
+            return destInfo.Exists && destInfo.Length == sourceInfo.Length;
         }
 
         /// <summary>Compares two files byte-for-byte and returns True if they match.</summary>
         [DebuggerStepThrough()]
-        public static async Task<bool> BinaryFileCompareAsync(this FileInfo sourceInfo, FileInfo destInfo)
-            => await BinaryFileCompareAsync(sourceInfo, destInfo, DefaultBufferSize);
+        public static async Task<bool> CompareBytes(this FileInfo sourceInfo, FileInfo destInfo)
+            => await CompareBytesAsync(sourceInfo, destInfo, DefaultBufferSize);
 
         /// <summary>Compares two files byte-for-byte and returns True if they match.</summary>
         [DebuggerStepThrough()]
-        public static async Task<bool> BinaryFileCompareAsync(this FileInfo sourceInfo, FileInfo destInfo, int bufferSize)
+        public static async Task<bool> CompareBytesAsync(this FileInfo sourceInfo, FileInfo destInfo, int bufferSize)
         {
             if (!sourceInfo.Exists || !destInfo.Exists || sourceInfo.Length != destInfo.Length)
             {
@@ -118,28 +144,6 @@ namespace FileTools
             // all the bytes read and compared total the file length
             bool success = (offset == fileLength);
             return success;
-        }
-
-        [DebuggerStepThrough()]
-        public static int RemoveEmptyFolders(this DirectoryInfo directory, string pattern = "*", bool recurse = true)
-        {
-            int count = 0;
-            Stack<string> stack = new Stack<string>();
-            stack.Push(directory.FullName);
-            foreach (var info in directory.EnumerateDirectories(pattern, recurse ? SearchOption.AllDirectories : SearchOption.TopDirectoryOnly))
-            {
-                stack.Push(info.FullName);
-            }
-            while (stack.Count > 0)
-            {
-                DirectoryInfo info = new DirectoryInfo(stack.Pop());
-                if (!info.GetFileSystemInfos().Any())
-                {
-                    info.Delete();
-                    count++;
-                }
-            }
-            return count;
         }
 
     }

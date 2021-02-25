@@ -1,7 +1,9 @@
 {
   "profiles": {
     "FolderClone": {
-      "commandName": "Project"
+      "commandName": "Project",
+      "commandLineArgs": "--recurse --clean --interactive",
+      "sqlDebugging": true
     }
   }
 }

@@ -1,4 +1,5 @@
 ﻿using FileTools;
+using FileTools.Parsing;
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -8,38 +9,110 @@ namespace FolderClone
 {
     internal static class Program
     {
-        const char KeyValueSeparator = '=';
+        #region fields and properties
+        
+        private const char _KeyValueSeparator = '=';
 
-        private static readonly string[] _ActionNames = Enum.GetNames<FileCompareAction>();
+        private static readonly FileAttributes[] _ValidAttribs = FolderCompareProcessor.GetSupportedAttributes().ToArray();
+        private static readonly FileCompareAction[] _ValidActions = Enum.GetValues<FileCompareAction>();
         private static readonly Dictionary<string, int> _EventStats =
             new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
 
         private static string Source { get; set; }
         private static string Target { get; set; }
+        private static TextWriter LogFile { get; set; }
+        private static TextWriter Error { get; set; }
+        private static TextWriter Display => Console.Out;
+        private static TextReader Keyboard => Console.In;
+
+        private static bool? Help { get; set; }
+        private static bool? Clean { get; set; }
+        private static bool? Prompt { get; set; }
+        private static bool? Verbose { get; set; }
+
+        private static readonly FolderCompareProcessor _Cloner =
+            new FolderCompareProcessor(new FileCompareProcessor())
+            {
+                OnActivityResult = CountStats,
+                OnException = OnException,
+                OnIgnoreFile = OnIgnoreFile,
+            };
+
+        private static string Attributes
+        {
+            get
+            {
+                var attribList = _Cloner.AttributeFilters
+                    .Where(x => x.Value.HasValue)
+                    .Select(x => $"{(x.Value.Value ? "" : "!")}{x.Key}");
+
+                return string.Join(",", attribList);
+            }
+        }
+        
+        #endregion
 
         internal static void Main(string[] args)
         {
-            var cloner = new FolderCompareProcessor(new FileCompareProcessor())
-            {
-                OnActivityResult = DisplayEvent,
-                OnException = (activity, ex) => Console.Error.WriteLine($"Error processing {activity.Action}: {ex.Message}"),
-            };
+            // default attributes to ignore:  
+            // To ignore the attribute, use 
+            // Example: /Attributes=?Sys,?Off,?Temp,?RP
+            _Cloner.AttributeFilters[FileAttributes.System] = false;
+            _Cloner.AttributeFilters[FileAttributes.Offline] = false;
+            _Cloner.AttributeFilters[FileAttributes.Temporary] = false;
+            _Cloner.AttributeFilters[FileAttributes.ReparsePoint] = false;
 
-            if (!ConfigureCloner(cloner, args, out bool clean))
+            LogFile = Console.Out;
+            Error = Console.Error;
+
+            // Configure from arguments / prompts.
+            var keyValues = args.ParseKeyValue(_KeyValueSeparator);
+
+            bool ok =
+                SetSwitches(args) &&
+                SetSource(keyValues) &&
+                SetTarget(keyValues) &&
+                SetAttributes(keyValues) &&
+                SetActions(keyValues);
+
+            if (ok && Prompt == true)
+                PromptForInput();
+
+            if (Help == true || Source.Equals(Target, StringComparison.CurrentCultureIgnoreCase))
             {
                 ShowHelp();
                 return;
             }
 
-            cloner.MatchTargetFilesAsync(Source, Target).GetAwaiter().GetResult();
+            if (Verbose == true)
+                _Cloner.OnActivityResult = (a, b) =>
+                {
+                    CountStats(a, b);
+                    DisplayVerboseActivities(a, b);
+                };
+
+            _Cloner.MatchTargetFilesAsync(Source, Target).GetAwaiter().GetResult();
             ShowStats();
-            if (clean)
+            if (Clean == true)
             {
                 CleanEmptyFolders(new DirectoryInfo(Source), new DirectoryInfo(Target));
             }
         }
 
-        private static void DisplayEvent(FileCompareActivity activity, bool result)
+        #region private methods
+
+        private static void OnIgnoreFile(FileInfo file)
+        {
+            if (Verbose == true)
+                LogFile.WriteLine($"Ignore: {file.FullName} ({file.Attributes})");
+        }
+
+        private static void OnException(FileCompareActivity activity, Exception ex)
+        {
+            Error.WriteLine($"Error processing {activity.Action}: {ex.Message}");
+        }
+
+        private static void CountStats(FileCompareActivity activity, bool result)
         {
             // Count events.
             var key = (result ? "" : "!") + activity.Action.ToString();
@@ -47,35 +120,38 @@ namespace FolderClone
                 _EventStats[key] += 1;
             else
                 _EventStats[key] = 1;
+        }
 
+        private static void DisplayVerboseActivities(FileCompareActivity activity, bool result)
+        {
             switch (activity.Action)
             {
                 case FileCompareAction.FindTarget:
-                    Console.WriteLine($"{activity.Action}: {activity.Target.FullName} ({result})");
+                    LogFile.WriteLine($"{activity.Action}: {activity.Target.FullName} ({result})");
                     break;
 
                 case FileCompareAction.CompareLengths:
-                    Console.WriteLine($"{activity.Action}: {activity.Target.FullName} ({result})");
+                    LogFile.WriteLine($"{activity.Action}: {activity.Target.FullName} ({result})");
                     break;
 
                 case FileCompareAction.CompareBytes:
-                    Console.WriteLine($"{activity.Action}: {activity.Target.FullName} ({result})");
+                    LogFile.WriteLine($"{activity.Action}: {activity.Target.FullName} ({result})");
                     break;
 
                 case FileCompareAction.WriteTarget:
-                    Console.WriteLine($"{activity.Action}: {activity.Target.FullName} ({result})");
+                    LogFile.WriteLine($"{activity.Action}: {activity.Target.FullName} ({result})");
                     break;
 
                 case FileCompareAction.WriteSource:
-                    Console.WriteLine($"{activity.Action}: {activity.Source.FullName} ({result})");
+                    LogFile.WriteLine($"{activity.Action}: {activity.Source.FullName} ({result})");
                     break;
 
                 case FileCompareAction.DeleteTarget:
-                    Console.WriteLine($"{activity.Action}: {activity.Target.FullName} ({result})");
+                    LogFile.WriteLine($"{activity.Action}: {activity.Target.FullName} ({result})");
                     break;
 
                 case FileCompareAction.DeleteSource:
-                    Console.WriteLine($"{activity.Action}: {activity.Source.FullName} ({result})");
+                    LogFile.WriteLine($"{activity.Action}: {activity.Source.FullName} ({result})");
                     break;
 
                 default:
@@ -85,217 +161,323 @@ namespace FolderClone
 
         private static void ShowStats()
         {
+            if (Verbose == false)
+                return;
+
             if (_EventStats.Any())
             {
-                Console.WriteLine("Event Counts:");
+                LogFile.WriteLine("Event Counts:");
                 foreach (var pair in _EventStats)
                 {
-                    Console.WriteLine($"\t {pair.Key} = {pair.Value}");
+                    LogFile.WriteLine($"\t {pair.Key} = {pair.Value}");
                 }
             }
             else
             {
-                Console.WriteLine("No Files Processed!");
+                LogFile.WriteLine("No Files Processed!");
+            }
+        }
+
+        private static void ShowHelp()
+        {
+            Display.WriteLine($"Usage:");
+            Display.Write($"FolderClone");
+            Display.Write($" {nameof(Source)}{_KeyValueSeparator}sourceFolder");
+            Display.Write($" {nameof(Target)}{_KeyValueSeparator}destinationFolder");
+            Display.Write($" {nameof(Attributes)}{_KeyValueSeparator}A,!Sys,!Temp,!Offline,!RP ");
+            Display.WriteLine($" [!]Action{_KeyValueSeparator}NextAction");
+
+            Display.WriteLine($"{nameof(Attributes)}:");
+            Display.WriteLine($" Optional comma separated list of attribute names, partial name, or Initials.");
+            Display.WriteLine($" Allowed Attributes: {string.Join(",", _ValidAttribs)}");
+            Display.WriteLine($" Included files must have Attribute set.");
+            Display.WriteLine($" ! (Exclamation) prefix must have Attribute not set.");
+            Display.WriteLine($" ? (Question) to Clear default flags:");
+            Display.WriteLine();
+
+            Display.WriteLine($"Action:");
+            Display.WriteLine($"  Actions are any one of: ({string.Join(", ", Enum.GetNames<FileCompareAction>())})");
+            Display.WriteLine($"  NextAction is the next action to take if Action returns true.");
+            Display.WriteLine($"  [!] indicates an optional ! (exclamation)  prefix indicates the NextAction is used when Action returns false. (Don't use square brackets).");
+            Display.WriteLine($"  Repeat [!]Action{_KeyValueSeparator}NextAction as needed.");
+
+            Display.WriteLine();
+
+            Display.WriteLine();
+            Display.WriteLine($"Switches:  (Optional)");
+            ShowSwitch(nameof(Help), "Display Help.");
+            ShowSwitch(nameof(Prompt), "Prompt for Parameters.");
+            ShowSwitch(nameof(_Cloner.Recurse), "Recurse through subdirectories.", 's');
+            ShowSwitch(nameof(Clean), "Clean out empty folders.");
+            ShowSwitch(nameof(Verbose), "Display Verbose output of files processed.");
+
+            Display.WriteLine();
+            Display.WriteLine("Example:");
+            Display.Write($"Source{_KeyValueSeparator}{Path.GetFullPath("/Data")} ");
+            Display.Write($"Target{_KeyValueSeparator}{Path.GetFullPath("/Backup")} ");
+            Display.Write($"--{nameof(_Cloner.Recurse)} ");
+            Display.Write($"!{nameof(FileCompareAction.FindTarget)}{_KeyValueSeparator}{nameof(FileCompareAction.WriteTarget)} ");
+            Display.Write($"{nameof(FileCompareAction.FindTarget)}{_KeyValueSeparator}{nameof(FileCompareAction.CompareLengths)} ");
+            Display.Write($"!{nameof(FileCompareAction.CompareLengths)}{_KeyValueSeparator}{nameof(FileCompareAction.WriteTarget)} ");
+            Display.WriteLine();
+
+            Display.WriteLine();
+
+            static void ShowSwitch(string switchName, string description, char? extraOption = null)
+            {
+                var options = string.Join('|', CommandParser.GetSwitchOptions(switchName, extraOption));
+                Display.WriteLine($"  [{options}]\t {description}");
             }
         }
 
         private static void CleanEmptyFolders(DirectoryInfo sourceFolder, DirectoryInfo targetFolder)
         {
-            Console.Write($"Folder: {sourceFolder} cleaning empty folders: ");
+            LogFile.Write($"Folder: {sourceFolder} cleaning empty folders: ");
             var count = sourceFolder.RemoveEmptyFolders();
-            Console.WriteLine($"{count} folders removed.");
+            LogFile.WriteLine($"{count} folders removed.");
 
-            Console.Write($"Folder: {targetFolder} cleaning empty folders: ");
+            LogFile.Write($"Folder: {targetFolder} cleaning empty folders: ");
             count = targetFolder.RemoveEmptyFolders();
-            Console.WriteLine($"{count} folders removed.");
+            LogFile.WriteLine($"{count} folders removed.");
         }
 
-        private static void ShowHelp()
+        private static bool SetSwitches(string[] args)
         {
-            Console.WriteLine($"Usage:");
-            Console.Write($"FolderClone");
-            Console.Write($" {nameof(Source)}{KeyValueSeparator}sourceFolder");
-            Console.Write($" {nameof(Target)}{KeyValueSeparator}destinationFolder");
-            Console.WriteLine($" [!]Action{KeyValueSeparator}NextAction");
-
-            Console.WriteLine($"Where:");
-            Console.WriteLine($"  Action is one of ({string.Join(", ", _ActionNames)})");
-            Console.WriteLine($"  NextAction is the next action to take if Action returns true.");
-            Console.WriteLine($"  [!] indicates an optional ! (exclamation)  prefix indicates the NextAction is used when Action returns false. (Don't use square brackets).");
-            Console.WriteLine($"  Repeat [!]Action{KeyValueSeparator}NextAction as needed.");
-
-            Console.WriteLine();
-            Console.WriteLine($"Switches:  (Optional)");
-            Console.WriteLine($"  [-?|-h|--help]\t Display Help.");
-            Console.WriteLine($"  [-i|--interactive]\t InterActive (Prompt for Options).");
-            Console.WriteLine($"  [-r|-s|--recurse]\t Recurse Subdirectories");
-            Console.WriteLine($"  [-a|--archive]\t Only Files with Archive bit set");
-            Console.WriteLine($"  [-c|--clean]\t Remove Empty Folders from Source and Target.");
-
-            Console.WriteLine();
-            Console.WriteLine("Example:");
-            Console.Write($"Source{KeyValueSeparator}{Path.GetFullPath("/Data")} ");
-            Console.Write($"Target{KeyValueSeparator}{Path.GetFullPath("/Backup")} ");
-            Console.Write($"--recurse ");
-            Console.Write($"!{nameof(FileCompareAction.FindTarget)}{KeyValueSeparator}{nameof(FileCompareAction.WriteTarget)} ");
-            Console.Write($"{nameof(FileCompareAction.FindTarget)}{KeyValueSeparator}{nameof(FileCompareAction.CompareLengths)} ");
-            Console.Write($"!{nameof(FileCompareAction.CompareLengths)}{KeyValueSeparator}{nameof(FileCompareAction.WriteTarget)} ");
-            Console.WriteLine();
-        }
-
-        /// <summary>Parse and configure the FolderProcessor.</summary>
-        /// <returns>true if ready to go. False if Help should be displayed.</returns>
-        private static bool ConfigureCloner(FolderCompareProcessor cloner, string[] args, out bool clean)
-        {
-            clean = args.HasSwitch("-c", "--clean");
-
-            if (args.HasSwitch("-h", "-?", "--help"))
+            if (args.HasSwitch(nameof(Help), '?'))
             {
-                // Returns False to Show Help or Wrong Input.
-                return false;
+                Help = true;
             }
 
-            cloner.Recurse = args.HasSwitch("-r", "--recurse");
-            cloner.ArchiveAttributeOnly = args.HasSwitch("-a", "--archive");
+            if (args.HasSwitch(nameof(Clean)))
+            {
+                Clean = true;
+            }
 
-            bool isInteractive = args.HasSwitch("-i", "--interactive");
+            if (args.HasSwitch(nameof(Prompt)))
+            {
+                Prompt = true;
+            }
 
-            var keyValues = args.ParseKeyValue(KeyValueSeparator);
+            if (args.HasSwitch(nameof(Verbose)))
+            {
+                Verbose = true;
+            }
 
+            if (args.HasSwitch(nameof(_Cloner.Recurse), 's'))
+                _Cloner.Recurse = true;
+
+            return Help != true;
+        }
+
+        private static bool SetSource(IDictionary<string, string> keyValues)
+        {
+            // Input Source Folder:
             if (keyValues.ContainsKey(nameof(Source)))
             {
                 Source = keyValues[nameof(Source)];
                 keyValues.Remove(nameof(Source));
             }
-            else if (isInteractive)
+            else if (Prompt == true)
             {
-                Console.Write("Enter Source Path:");
-                Source = Console.ReadLine();
+                Display.Write("Enter Source Path: ");
+                Source = Keyboard.ReadLine();
             }
             if (string.IsNullOrEmpty(Source))
             {
-                Console.WriteLine($"{nameof(Source)} is Required.");
-                return false;
+                Error.WriteLine($"{nameof(Source)} is Required.");
+                Help = true;
             }
+            return Help != true;
+        }
 
+        private static bool SetTarget(IDictionary<string, string> keyValues)
+        {
+            // Input Target Folder:
             if (keyValues.ContainsKey(nameof(Target)))
             {
                 Target = keyValues[nameof(Target)];
                 keyValues.Remove(nameof(Target));
             }
-            else if (isInteractive)
+            else if (Prompt == true)
             {
-                Console.Write("Enter Target Path:");
-                Target = Console.ReadLine();
+                Display.Write("Enter Target Path: ");
+                Target = Keyboard.ReadLine();
             }
             if (string.IsNullOrWhiteSpace(Target))
             {
-                Console.WriteLine($"{nameof(Target)} is Required.");
-                return false;
+                Error.WriteLine($"{nameof(Target)} is Required.");
+                Help = true;
+            }
+            return Help != true;
+        }
+
+        private static bool SetAttributes(IDictionary<string, string> keyValues)
+        {
+            var key = nameof(Attributes);
+            if (keyValues.ContainsKey(key))
+            {
+                var values = keyValues[key];
+                keyValues.Remove(key);
+
+                foreach (var item in values.Split(','))
+                {
+                    bool? hasFlagSet = true;
+                    var name = item.Trim();
+                    if (name.StartsWith("!"))
+                    {
+                        name = name[1..];
+                        hasFlagSet = false;
+                    }
+                    else if (name.StartsWith("?"))
+                    {
+                        name = name[1..];
+                        hasFlagSet = null; // clear the flag.
+                    }
+                    var attribute = _ValidAttribs.FindFirst(name);
+                    if (attribute != null)
+                    {
+                        _Cloner.AttributeFilters[attribute.Value] = hasFlagSet;
+                    }
+                    else
+                    {
+                        Error.WriteLine($"{name} does not match: {string.Join(", ", _ValidAttribs)}");
+                        Help = true;
+                    }
+                }
+
             }
 
+            if (!string.IsNullOrWhiteSpace(Attributes))
+            {
+                LogFile.WriteLine($"{nameof(Attributes)}{_KeyValueSeparator}{Attributes}");
+            }
+
+            return Help != true;
+        }
+
+        private static bool SetActions(IDictionary<string, string> keyValues)
+        {
             foreach (var pair in keyValues)
             {
-                string actionName = pair.Key;
-                bool isBang = actionName?.StartsWith('!') ?? false;
-                if (isBang)
+                string actionName = pair.Key?.Trim() ?? string.Empty;
+                string nextActionName = pair.Value?.Trim() ?? string.Empty;
+
+                bool isBang = false;
+                if (actionName.StartsWith('!'))
+                {
+                    isBang = true;
                     actionName = actionName[1..];
+                }
 
-                if (!TryParseAction(actionName, out FileCompareAction? forAction))
+                var forAction = _ValidActions.FindFirst(actionName);
+                var nextAction = _ValidActions.FindFirst(nextActionName);
+
+                if (forAction == null || (nextAction == null && nextActionName.Length > 0))
+                {
+                    var or = nextActionName.Length > 0 ? " or " : "";
+                    Error.WriteLine($"Unknown Action: {actionName}{or}{nextActionName}");
+                    Help = true;
                     return false;
-                if (forAction.HasValue)
+                }
+                _Cloner.SetNextAction(forAction.Value, !isBang, nextAction);
+            }
+            return Help != true;
+        }
+
+        private static void PromptForInput()
+        {
+            Display.WriteLine($"{nameof(Source)}{_KeyValueSeparator}{Source}");
+            Display.WriteLine($"{nameof(Target)}{_KeyValueSeparator}{Target}");
+
+            if (PromptYesNo("Show Help Now"))
+            {
+                ShowHelp();
+            }
+
+            if (!_Cloner.Recurse.HasValue)
+            {
+                _Cloner.Recurse = PromptYesNo(nameof(_Cloner.Recurse));
+            }
+
+            if (!Clean.HasValue)
+            {
+                Clean = PromptYesNo(nameof(Clean));
+            }
+
+            if (!Verbose.HasValue)
+            {
+                Verbose = PromptYesNo(nameof(Verbose));
+            }
+
+            if(PromptYesNo("Setup Each Action"))
+            {
+                foreach (var action in _ValidActions)
                 {
-                    // next action when true (before colon)
-                    actionName = pair.Value?.Trim() ?? string.Empty;
+                    if (_Cloner.GetNextAction(action, true) == null || _Cloner.GetNextAction(action, false) == null)
+                    {
+                        var options = _ValidActions.Where(key => key != action).Select(key => key.ToString());
+                        Display.WriteLine($"Options for {action} are: {string.Join(',', options)}");
 
-                    if (!TryParseAction(actionName, out FileCompareAction? nextAction))
-                        return false;
-
-                    cloner.SetNextAction(forAction.Value, !isBang, nextAction);
+                        PromptForAction(action, true);
+                        PromptForAction(action, false);
+                    }
                 }
             }
 
-            if (isInteractive)
+            Display.WriteLine($"{nameof(Attributes)}{_KeyValueSeparator}{Attributes}");
+            Display.WriteLine("Enter Additional Attributes (or leave blank to keep) and Press Enter: ");
+            var newAttribs = Keyboard.ReadLine();
+            if(!string.IsNullOrEmpty(newAttribs))
             {
-                Console.WriteLine($"{nameof(Source)}{KeyValueSeparator}{Source}");
-                Console.WriteLine($"{nameof(Target)}{KeyValueSeparator}{Target}");
+                var dict = new Dictionary<string, string>();
+                dict.Add(nameof(Attributes), newAttribs);
+                SetAttributes(dict);
+            }    
 
-                if (!cloner.Recurse)
-                {
-                    Console.Write($"Use --recurse [Y|N]? ");
-                    char yn = Console.ReadKey().KeyChar;
-                    Console.WriteLine();
-                    cloner.Recurse = yn == 'y' || yn == 'Y';
-                }
-
-                if (!cloner.ArchiveAttributeOnly)
-                {
-                    Console.Write($"Use --archive [Y|N]? ");
-                    char yn = Console.ReadKey().KeyChar;
-                    Console.WriteLine();
-                    cloner.ArchiveAttributeOnly = yn == 'y' || yn == 'Y';
-                }
-
-                if(!clean)
-                {
-                    Console.Write($"Use --clean [Y|N]? ");
-                    char yn = Console.ReadKey().KeyChar;
-                    Console.WriteLine();
-                    clean = yn == 'y' || yn == 'Y';
-                }
-
-                var allActions = Enum.GetValues<FileCompareAction>();
-
-                foreach (var action in allActions)
-                {
-                    Prompt(cloner, action, true);
-                    Prompt(cloner, action, false);
-                }
-            }
-
-            return true;
-
-            static void Prompt(FolderCompareProcessor cloner, FileCompareAction action, bool actionResult)
+            // nested helper method(s)...
+            static bool PromptYesNo(string prompt)
             {
-                var options = _ActionNames.Where(key => !key.Equals(action.ToString(), StringComparison.CurrentCultureIgnoreCase));
-                if (actionResult)
+                Display.Write($"{prompt} [Y|N]? ");
+                bool? value = null;
+                while (!value.HasValue)
                 {
-                    Console.WriteLine($"Options for {action} are: {string.Join(',', options)}");
+                    int readChar = Keyboard.Read();
+                    char yn = Convert.ToChar(readChar);
+                    value =
+                        (yn == 'y' || yn == 'Y') ?
+                        true :
+                        (yn == 'n' || yn == 'n') ?
+                        false :
+                        null;
                 }
-                if( cloner.GetNextAction(action, actionResult).HasValue)
-                {
-                    // existing value... skip!
-                    return;
-                }
-
-                var bang = actionResult ? "" : "!";
-                Console.Write($"{bang}{action}{KeyValueSeparator}");
-                string actionName = Console.ReadLine();
-                if (TryParseAction(actionName, out FileCompareAction? nextAction))
-                {
-                    cloner.SetNextAction(action, actionResult, nextAction);
-                }
-            }
-
-            static bool TryParseAction(string actionName, out FileCompareAction? action)
-            {
-                if (string.IsNullOrWhiteSpace(actionName))
-                {
-                    action = null;
-                    return true;
-                }
-
-                if (Enum.TryParse<FileCompareAction>(actionName, out FileCompareAction parsed))
-                {
-                    action = parsed;
-                    return true;
-                }
-
-                Console.WriteLine($"Invalid Action Name: {actionName}");
-                action = null;
-                return false;
+                Display.WriteLine();
+                return value.Value;
             }
         }
 
+        private static void PromptForAction(FileCompareAction action, bool actionResult)
+        {
+            if (_Cloner.GetNextAction(action, actionResult).HasValue)
+            {
+                // already set... skip input.
+                return;
+            }
+
+            var bang = actionResult ? "" : "!";
+            Display.Write($"{bang}{action}{_KeyValueSeparator}");
+            string actionName = Keyboard.ReadLine();
+            var nextAction = _ValidActions.FindFirst(actionName);
+
+            if (nextAction != null || string.IsNullOrWhiteSpace(actionName))
+            {
+                _Cloner.SetNextAction(action, actionResult, nextAction);
+            }
+            else
+            {
+                Error.WriteLine($"Invalid Action Name: {actionName}");
+            }
+        }
+
+        #endregion
     }
 }

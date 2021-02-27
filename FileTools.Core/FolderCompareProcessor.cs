@@ -2,6 +2,7 @@
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Linq;
 using System.Threading.Tasks;
 
 namespace FileTools
@@ -18,23 +19,26 @@ namespace FileTools
         public Action<FileCompareActivity, bool> OnActivityResult { get; set; }
 
         public Action<FileCompareActivity, Exception> OnException { get; set; }
+        public Action<FileInfo> OnIgnoreFile { get; set; }
 
         /// <summary>If True will recurse through subdirectories</summary>
-        public bool Recurse { get; set; }
-        public bool ArchiveAttributeOnly { get; set; }
+        public bool? Recurse { get; set; }
 
         /// <summary>File Filter Predicate.  Returns True for files to Process.</summary>
         /// <remarks>Null implies no filter.</remarks>
         public Func<FileInfo, bool> FileFilter { get; set; }
 
+        public Dictionary<FileAttributes, bool?> AttributeFilters { get; }
+
         public int ActionCount => _NextActionWhenTrue.Count + _NextActionWhenFalse.Count;
+
         public FileCompareAction? GetNextAction(FileCompareAction current, bool currentResult)
         {
             var dict = currentResult ? _NextActionWhenTrue : _NextActionWhenFalse;
             FileCompareAction? value = dict.ContainsKey(current) ? dict[current] : null;
             return value;
         }
-        public FolderCompareProcessor SetNextAction(FileCompareAction current, bool currentResult, FileCompareAction? next)
+        public void SetNextAction(FileCompareAction current, bool currentResult, FileCompareAction? next)
         {
             var dict = currentResult ? _NextActionWhenTrue : _NextActionWhenFalse;
             if(next.HasValue)
@@ -45,7 +49,6 @@ namespace FileTools
             {
                 dict.Remove(current);
             }
-            return this;
         }
 
         private IFileCompareProcessor Processor { get; }
@@ -56,6 +59,7 @@ namespace FileTools
         public FolderCompareProcessor(FileCompareProcessor compareProcessor)
         {
             Processor = compareProcessor;
+            AttributeFilters = new Dictionary<FileAttributes, bool?>(GetSupportedAttributes().Select(attrib => new KeyValuePair<FileAttributes, bool?>(attrib, (bool?)null)));
         }
 
         /// <summary>Process each file in folder, and set up a comparison to matching relative path in another folder</summary>
@@ -83,21 +87,25 @@ namespace FileTools
             {
                 targetFolder.Create();
             }
+            if (sourceFolder.FullName.Equals(targetFolder.FullName, StringComparison.CurrentCultureIgnoreCase))
+                throw new ArgumentException("Source and Target paths must be different");
 
             string sourcePrefix = FolderPath(sourceFolder);
             string destPrefix = FolderPath(targetFolder);
 
             SearchOption recurseOption =
-                Recurse ?
+                Recurse == true ?
                 SearchOption.AllDirectories :
                 SearchOption.TopDirectoryOnly;
+
+            var attribFilter = AttributeFilters.Where(x => x.Value.HasValue).ToArray();
 
             var files = sourceFolder.EnumerateFiles(filePattern ?? "*", recurseOption);
             foreach (var sourceFile in files)
             {
                 // option to filter to only files with Archive Attribute Set.
-                bool includeFile =
-                    (ArchiveAttributeOnly == false || sourceFile.Attributes.HasFlag(FileAttributes.Archive)) &&
+                bool includeFile = 
+                    attribFilter.All(item => item.Value.Value == sourceFile.Attributes.HasFlag(item.Key)) &&
                     (FileFilter == null || FileFilter(sourceFile));
 
                 if (includeFile)
@@ -140,6 +148,10 @@ namespace FileTools
                         OnException?.Invoke(activity, ex);
                     }
                 }
+                else
+                {
+                    OnIgnoreFile?.Invoke(sourceFile);
+                }
             }
 
             [DebuggerStepThrough()]
@@ -149,6 +161,27 @@ namespace FileTools
                 info.FullName + Path.DirectorySeparatorChar;
         }
 
+
+        public static IEnumerable<FileAttributes> GetSupportedAttributes()
+        {
+            yield return FileAttributes.Archive;
+            yield return FileAttributes.ReadOnly;
+            yield return FileAttributes.Hidden;
+            yield return FileAttributes.Compressed;
+            yield return FileAttributes.NotContentIndexed;
+            yield return FileAttributes.Encrypted;
+            yield return FileAttributes.Offline;
+            yield return FileAttributes.Temporary;
+            yield return FileAttributes.ReparsePoint;    // RoboCopy does not allow in /xa: or /ia: 
+            yield return FileAttributes.System;
+
+            // yield return FileAttributes.Directory;       // We are scanning files or folders specifically.
+            // yield return FileAttributes.Normal;          // Not important to check.
+            // yield return FileAttributes.SparseFile;      // Not important to check.
+            // yield return FileAttributes.IntegrityStream; // Ignore ReFS feature.
+            // yield return FileAttributes.NoScrubData;     // Ignore ReFS feature.
+            // yield return FileAttributes.Device;          // Device is not valid.
+        }
 
     }
 
